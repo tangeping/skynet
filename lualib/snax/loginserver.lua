@@ -8,6 +8,10 @@ local assert = assert
 
 --[[
 
+WARNING :
+	Only 64 bits (too short) key here is used for the Diffie-Hellman exchange,
+	So it's insecure (At least 2048 bits recommended). DON'T use it directly in any serious project.
+
 Protocol:
 
 	line (\n) based text protocol
@@ -24,7 +28,6 @@ Protocol:
 	10. Server->Client : 200 base64(subid)
 
 Error Code:
-	400 Bad Request . challenge failed
 	401 Unauthorized . unauthorized by auth_handler
 	403 Forbidden . login_handler failed
 	406 Not Acceptable . already in login (disallow multi login)
@@ -70,7 +73,6 @@ local function launch_slave(auth_handler)
 		local hmac = crypt.hmac64(challenge, secret)
 
 		if hmac ~= crypt.base64decode(response) then
-			write("auth", fd, "400 Bad Request\n")
 			error "challenge failed"
 		end
 
@@ -179,7 +181,7 @@ local function launch_master(conf)
 				skynet.error(string.format("invalid client (fd = %d) error = %s", fd, err))
 			end
 		end
-		socket.close_fd(fd)	-- We haven't call socket.start, so use socket.close_fd rather than socket.close.
+		socket.close(fd)
 	end)
 end
 

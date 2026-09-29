@@ -41,6 +41,9 @@ end
 
 function provider.launch(name, code, ...)
 	local s = svr[name]
+	if s.address then
+		return skynet.ret(skynet.pack(s.address))
+	end
 	if s.booting then
 		table.insert(s.queue, skynet.response())
 	else
@@ -86,6 +89,16 @@ function provider.test(name)
 	else
 		skynet.ret()	-- nil
 	end
+end
+
+function provider.close(name)
+	local s = svr[name]
+	if not s or s.booting then
+		return skynet.ret(skynet.pack(nil))
+	end
+
+	svr[name] = nil
+	skynet.ret(skynet.pack(s.address))
 end
 
 skynet.start(function()

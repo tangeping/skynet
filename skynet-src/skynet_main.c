@@ -3,7 +3,6 @@
 #include "skynet_imp.h"
 #include "skynet_env.h"
 #include "skynet_server.h"
-#include "luashrtbl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +12,10 @@
 #include <lauxlib.h>
 #include <signal.h>
 #include <assert.h>
+
+#ifndef SKYNET_MAXTHREAD
+#define SKYNET_MAXTHREAD 1024
+#endif
 
 static int
 optint(const char *key, int opt) {
@@ -126,13 +129,17 @@ main(int argc, char *argv[]) {
 		return 1;
 	}
 
-	luaS_initshr();
 	skynet_globalinit();
 	skynet_env_init();
 
 	sigign();
 
 	struct skynet_config config;
+
+#ifdef LUA_CACHELIB
+	// init the lock of code cache
+	luaL_initcodecache();
+#endif
 
 	struct lua_State *L = luaL_newstate();
 	luaL_openlibs(L);	// link lua lib
@@ -148,8 +155,13 @@ main(int argc, char *argv[]) {
 		return 1;
 	}
 	_init_env(L);
+	lua_close(L);
 
 	config.thread =  optint("thread",8);
+	if (config.thread < 1 || config.thread > SKYNET_MAXTHREAD) {
+		fprintf(stderr, "Invalid thread %d , should be in [1,%d]\n", config.thread, SKYNET_MAXTHREAD);
+		return 1;
+	}
 	config.module_path = optstring("cpath","./cservice/?.so");
 	config.harbor = optint("harbor", 1);
 	config.bootstrap = optstring("bootstrap","snlua bootstrap");
@@ -158,11 +170,8 @@ main(int argc, char *argv[]) {
 	config.logservice = optstring("logservice", "logger");
 	config.profile = optboolean("profile", 1);
 
-	lua_close(L);
-
 	skynet_start(&config);
 	skynet_globalexit();
-	luaS_exitshr();
 
 	return 0;
 }

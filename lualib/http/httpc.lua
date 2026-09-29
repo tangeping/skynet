@@ -1,85 +1,15 @@
 local skynet = require "skynet"
 local socket = require "http.sockethelper"
-local url = require "http.url"
 local internal = require "http.internal"
 local dns = require "skynet.dns"
+
 local string = string
 local table = table
+local pcall = pcall
+local error = error
+local pairs = pairs
 
 local httpc = {}
-
-local function request(fd, method, host, url, recvheader, header, content)
-	local read = socket.readfunc(fd)
-	local write = socket.writefunc(fd)
-	local header_content = ""
-	if header then
-		if not header.host then
-			header.host = host
-		end
-		for k,v in pairs(header) do
-			header_content = string.format("%s%s:%s\r\n", header_content, k, v)
-		end
-	else
-		header_content = string.format("host:%s\r\n",host)
-	end
-
-	if content then
-		local data = string.format("%s %s HTTP/1.1\r\n%scontent-length:%d\r\n\r\n", method, url, header_content, #content)
-		write(data)
-		write(content)
-	else
-		local request_header = string.format("%s %s HTTP/1.1\r\n%scontent-length:0\r\n\r\n", method, url, header_content)
-		write(request_header)
-	end
-
-	local tmpline = {}
-	local body = internal.recvheader(read, tmpline, "")
-	if not body then
-		error(socket.socket_error)
-	end
-
-	local statusline = tmpline[1]
-	local code, info = statusline:match "HTTP/[%d%.]+%s+([%d]+)%s+(.*)$"
-	code = assert(tonumber(code))
-
-	local header = internal.parseheader(tmpline,2,recvheader or {})
-	if not header then
-		error("Invalid HTTP response header")
-	end
-
-	local length = header["content-length"]
-	if length then
-		length = tonumber(length)
-	end
-	local mode = header["transfer-encoding"]
-	if mode then
-		if mode ~= "identity" and mode ~= "chunked" then
-			error ("Unsupport transfer-encoding")
-		end
-	end
-
-	if mode == "chunked" then
-		body, header = internal.recvchunkedbody(read, nil, header, body)
-		if not body then
-			error("Invalid response body")
-		end
-	else
-		-- identity mode
-		if length then
-			if #body >= length then
-				body = body:sub(1,length)
-			else
-				local padding = read(length - #body)
-				body = body .. padding
-			end
-		else
-			-- no content-length, read all
-			body = body .. socket.readall(fd)
-		end
-	end
-
-	return code, body
-end
 
 local async_dns
 
@@ -88,38 +18,163 @@ function httpc.dns(server,port)
 	dns.server(server,port)
 end
 
-function httpc.request(method, host, url, recvheader, header, content)
-	local timeout = httpc.timeout	-- get httpc.timeout before any blocked api
-	local hostname, port = host:match"([^:]+):?(%d*)$"
-	if port == "" then
-		port = 80
+local default_port = {
+	http = 80,
+	https = 443,
+}
+
+local function parse_host(host)
+	local colon1 = host:find(":", 1, true)
+	if not colon1 then
+		-- no colon: bare hostname or bare ipv4
+		local htype = host:find("^%d+%.%d+%.%d+%.%d+$") and "ipv4" or "hostname"
+		return host, nil, htype
+	end
+
+	if host:find(":", colon1 + 1, true) then
+		-- two or more colons: ipv6
+		local ipv6, port = host:match("^%[(.-)%]:?(%d*)$")
+		if ipv6 then
+			return ipv6, port ~= "" and tonumber(port) or nil, "ipv6"
+		end
+		error(string.format("Invalid host: bare IPv6 address '%s', use '[%s]' instead", host, host))
+	end
+
+	-- single colon: host:port
+	local h, port = host:match("^(.-):(%d+)$")
+	if h then
+		local htype = h:find("^%d+%.%d+%.%d+%.%d+$") and "ipv4" or "hostname"
+		return h, tonumber(port), htype
+	end
+	return host, nil, "hostname"
+end
+
+local function parse_url(host)
+	local protocol, hostname = host:match "^(%a+)://(.*)"
+	if protocol then
+		protocol = string.lower(protocol)
 	else
-		port = tonumber(port)
+		protocol = "http"
+		hostname = host
 	end
-	if async_dns and not hostname:match(".*%d+$") then
-		hostname = dns.resolve(hostname)
+	local hostheader = hostname
+	local htype, port
+	hostname, port, htype = parse_host(hostname)
+	port = port or default_port[protocol]
+	if not port then
+		error("Invalid protocol: " .. protocol)
 	end
-	local fd = socket.connect(hostname, port, timeout)
+	return protocol, hostname, port, htype, hostheader
+end
+
+local SSLCTX_CLIENT = nil
+local function gen_interface(protocol, fd, hostname)
+	if protocol == "http" then
+		return {
+			init = nil,
+			close = nil,
+			read = socket.readfunc(fd),
+			write = socket.writefunc(fd),
+			readall = function ()
+				return socket.readall(fd)
+			end,
+		}
+	elseif protocol == "https" then
+		local tls = require "http.tlshelper"
+		SSLCTX_CLIENT = SSLCTX_CLIENT or tls.newctx()
+		local tls_ctx = tls.newtls("client", SSLCTX_CLIENT, hostname)
+		return {
+			init = tls.init_requestfunc(fd, tls_ctx),
+			close = tls.closefunc(tls_ctx),
+			read = tls.readfunc(fd, tls_ctx),
+			write = tls.writefunc(fd, tls_ctx),
+			readall = tls.readallfunc(fd, tls_ctx),
+		}
+	else
+		error(string.format("Invalid protocol: %s", protocol))
+	end
+end
+
+local function connect(host, timeout)
+	local protocol, hostname, port, htype, hostheader = parse_url(host)
+	local hostaddr = hostname
+	if htype == "hostname" then
+		if async_dns then
+			local msg
+			hostaddr, msg = dns.resolve(hostname)
+			if not hostaddr then
+				error(string.format("%s dns resolve failed msg:%s", hostname, msg))
+			end
+		end
+	end
+
+	local fd = socket.connect(hostaddr, port, timeout)
 	if not fd then
-		error(string.format("http connect error host:%s, port:%s, timeout:%s", hostname, port, timeout))
-		return
+		error(string.format("%s connect error host:%s, port:%s, timeout:%s", protocol, hostname, port, timeout))
 	end
-	local finish
+	local interface = gen_interface(protocol, fd, htype == "hostname" and hostname or nil)
 	if timeout then
 		skynet.timeout(timeout, function()
-			if not finish then
+			if not interface.finish then
 				socket.shutdown(fd)	-- shutdown the socket fd, need close later.
 			end
 		end)
 	end
-	local ok , statuscode, body = pcall(request, fd,method, host, url, recvheader, header, content)
-	finish = true
+	if interface.init then
+		interface.init(htype == "hostname" and hostname or nil)
+	end
+	return fd, interface, hostheader
+end
+
+local function close_interface(interface, fd)
+	interface.finish = true
 	socket.close(fd)
+	if interface.close then
+		interface.close()
+		interface.close = nil
+	end
+end
+
+function httpc.request(method, hostname, url, recvheader, header, content)
+	local fd, interface, host = connect(hostname, httpc.timeout)
+	local ok , statuscode, body , header = pcall(internal.request, interface, method, host, url, recvheader, header, content)
+	if ok then
+		ok, body = pcall(internal.response, interface, statuscode, body, header)
+	end
+	close_interface(interface, fd)
 	if ok then
 		return statuscode, body
 	else
+		error(body or statuscode)
+	end
+end
+
+function httpc.head(hostname, url, recvheader, header, content)
+	local fd, interface, host = connect(hostname, httpc.timeout)
+	local ok , statuscode = pcall(internal.request, interface, "HEAD", host, url, recvheader, header, content)
+	close_interface(interface, fd)
+	if ok then
+		return statuscode
+	else
 		error(statuscode)
 	end
+end
+
+function httpc.request_stream(method, hostname, url, recvheader, header, content)
+	local fd, interface, host = connect(hostname, httpc.timeout)
+	local ok , statuscode, body , header = pcall(internal.request, interface, method, host, url, recvheader, header, content)
+	interface.finish = true -- don't shutdown fd in timeout
+	local function close_fd()
+		close_interface(interface, fd)
+	end
+	if not ok then
+		close_fd()
+		error(statuscode)
+	end
+	-- todo: stream support timeout
+	local stream = internal.response_stream(interface, statuscode, body, header)
+	stream._onclose = close_fd
+	return stream
 end
 
 function httpc.get(...)
